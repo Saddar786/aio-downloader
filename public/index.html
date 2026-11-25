@@ -1,0 +1,146 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>All-In-One Media Downloader</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen flex items-center justify-center p-4">
+
+  <div class="w-full max-w-xl bg-slate-900 border border-slate-800 rounded-2xl p-6 shadow-2xl">
+    <div class="text-center mb-5">
+      <h1 class="text-2xl font-bold text-white">All-In-One Downloader</h1>
+      <p class="text-slate-400 text-xs mt-1">YouTube • TikTok • Instagram • Facebook • X • Pinterest</p>
+    </div>
+
+    <form id="dlForm" class="flex flex-col sm:flex-row gap-2.5">
+      <input
+        type="url"
+        id="videoUrl"
+        required
+        placeholder="Paste video or audio link here..."
+        class="flex-1 bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-sm text-white placeholder-slate-400 focus:outline-none focus:border-emerald-500"
+      />
+      <button
+        type="submit"
+        id="submitBtn"
+        class="bg-emerald-600 hover:bg-emerald-500 text-white font-semibold px-6 py-3 rounded-xl text-sm transition cursor-pointer"
+      >
+        Download
+      </button>
+    </form>
+
+    <div id="statusBox" class="hidden mt-4 p-3 rounded-xl text-sm"></div>
+
+    <div id="resultBox" class="hidden mt-6 border-t border-slate-800 pt-5 space-y-4">
+      <div class="flex gap-4 items-center">
+        <img id="thumbImg" src="" alt="Thumbnail" class="hidden w-28 h-20 object-cover rounded-lg border border-slate-700" />
+        <div class="flex-1 min-w-0">
+          <span id="platformBadge" class="inline-block text-[10px] uppercase font-bold px-2 py-0.5 rounded bg-emerald-950 text-emerald-400 border border-emerald-800 mb-1"></span>
+          <h2 id="videoTitle" class="font-semibold text-base text-white line-clamp-2"></h2>
+        </div>
+      </div>
+
+      <div id="linksContainer" class="grid grid-cols-1 sm:grid-cols-2 gap-2.5"></div>
+    </div>
+  </div>
+
+  <script>
+    const form = document.getElementById("dlForm");
+    const urlInput = document.getElementById("videoUrl");
+    const submitBtn = document.getElementById("submitBtn");
+    const statusBox = document.getElementById("statusBox");
+    const resultBox = document.getElementById("resultBox");
+    const thumbImg = document.getElementById("thumbImg");
+    const platformBadge = document.getElementById("platformBadge");
+    const videoTitle = document.getElementById("videoTitle");
+    const linksContainer = document.getElementById("linksContainer");
+
+    function showStatus(msg, isError = false) {
+      statusBox.textContent = msg;
+      statusBox.className = `mt-4 p-3 rounded-xl text-sm ${
+        isError
+          ? "bg-red-950/70 border border-red-800 text-red-300"
+          : "bg-slate-800 border border-slate-700 text-slate-300"
+      }`;
+      statusBox.classList.remove("hidden");
+    }
+
+    async function directDownload(url, filename, btn) {
+      const oldText = btn.innerHTML;
+      btn.disabled = true;
+      btn.innerHTML = "Downloading...";
+      try {
+        const res = await fetch(url);
+        if (!res.ok) throw new Error("Direct stream fallback");
+        const blob = await res.blob();
+        const blobUrl = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = blobUrl;
+        a.download = filename;
+        document.body.appendChild(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(blobUrl), 5000);
+      } catch {
+        window.open(url, "_blank");
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = oldText;
+      }
+    }
+
+    form.addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const targetUrl = urlInput.value.trim();
+      if (!targetUrl) return;
+
+      resultBox.classList.add("hidden");
+      linksContainer.innerHTML = "";
+      submitBtn.disabled = true;
+      submitBtn.textContent = "Fetching...";
+      showStatus("Fetching video links...");
+
+      try {
+        const res = await fetch(`/api/download?url=${encodeURIComponent(targetUrl)}`);
+        const data = await res.json();
+
+        if (!res.ok || data.error) {
+          throw new Error(data.error || "Failed to fetch links");
+        }
+
+        statusBox.classList.add("hidden");
+        resultBox.classList.remove("hidden");
+
+        platformBadge.textContent = `${data.platform || "Media"} (${data.source || "API"})`;
+        videoTitle.textContent = data.title || "Ready to Download";
+
+        if (data.thumbnail) {
+          thumbImg.src = data.thumbnail;
+          thumbImg.classList.remove("hidden");
+        } else {
+          thumbImg.classList.add("hidden");
+        }
+
+        const safeName = (data.title || "download").replace(/[^a-z0-9]/gi, "_").slice(0, 40);
+
+        (data.medias || []).forEach((m) => {
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className =
+            "bg-slate-800 hover:bg-emerald-600 border border-slate-700 hover:border-emerald-500 text-white font-medium py-2.5 px-4 rounded-xl text-xs transition flex items-center justify-between cursor-pointer";
+          btn.innerHTML = `<span>${m.label || m.quality}</span><span>↓</span>`;
+          btn.onclick = () => directDownload(m.url, `${safeName}_${m.quality}.${m.extension || "mp4"}`, btn);
+          linksContainer.appendChild(btn);
+        });
+      } catch (err) {
+        showStatus(err.message, true);
+      } finally {
+        submitBtn.disabled = false;
+        submitBtn.textContent = "Download";
+      }
+    });
+  </script>
+</body>
+</html>
