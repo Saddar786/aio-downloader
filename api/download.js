@@ -3,6 +3,7 @@ const dns = require("dns");
 const querystring = require("querystring");
 const crypto = require("crypto");
 const vm = require("vm");
+const { Readable } = require("stream");
 
 dns.setServers(["8.8.8.8", "1.1.1.1"]);
 
@@ -142,7 +143,6 @@ async function resolveOmdown(mediaUrl, baseApiUrl) {
   const html = await initRes.text();
   let actionId = null;
 
-  // Extract Vercel deployment ID if present in chunk URLs (?dpl=...)
   const dplMatch = html.match(/[?&]dpl=(dpl_[a-zA-Z0-9]+)/);
   const deploymentId = dplMatch ? dplMatch[1] : null;
 
@@ -216,13 +216,15 @@ async function resolveOmdown(mediaUrl, baseApiUrl) {
       if (!dl.includes("download=1")) dl += (dl.includes("?") ? "&" : "?") + "download=1";
 
       const proxiedUrl = `${baseApiUrl}?proxy=1&url=${encodeURIComponent(dl)}&ck=${encodeURIComponent(cookies)}`;
-      const isAudio = /audio/.test(fmt.kind || "") || fmt.ext === "mp3" || fmt.ext === "m4a";
+      const ext = (fmt.ext || "").toLowerCase();
+      const isAudio = /audio/.test(fmt.kind || "") || ["mp3", "m4a", "opus", "wav"].includes(ext);
+      const isImage = /image|photo|thumb/.test(fmt.kind || "") || ["jpg", "jpeg", "png", "webp"].includes(ext);
 
       medias.push({
         url: proxiedUrl,
         quality: fmt.quality || fmt.label || "HD",
-        extension: fmt.ext || (isAudio ? "mp3" : "mp4"),
-        type: isAudio ? "audio" : "video",
+        extension: ext || (isAudio ? "mp3" : isImage ? "jpg" : "mp4"),
+        type: isAudio ? "audio" : isImage ? "image" : "video",
         label: fmt.label || fmt.quality || "Download",
       });
     }
@@ -253,7 +255,7 @@ async function resolveOmdown(mediaUrl, baseApiUrl) {
 }
 
 // ==========================================
-// 2. SAVEFROM RESOLVER (from savefrom.js)
+// 2. SAVEFROM RESOLVER (Fallback)
 // ==========================================
 async function resolveSaveFrom(targetUrl) {
   const SALT = "b7944d7a59c9cb654228624880e7de59a53842c2d912b449fdf11febcf81cb21";
@@ -372,7 +374,7 @@ async function resolveSaveFrom(targetUrl) {
 }
 
 // ==========================================
-// 3. Y2MATE RESOLVER (from y2mate.js)
+// 3. Y2MATE RESOLVER (YouTube)
 // ==========================================
 function makeHttpsRequest(urlStr, method, headers = {}, body = null) {
   return new Promise((resolve, reject) => {
@@ -502,6 +504,7 @@ module.exports = async function handler(req, res) {
   const host = req.headers.host;
   const baseApiUrl = `${proto}://${host}/api/download`;
 
+  // Streaming Proxy for OmDown session-locked files (bypasses 4.5MB buffer limit)
   if (req.query.proxy === "1") {
     const target = req.query.url;
     const ck = req.query.ck || "";
@@ -519,11 +522,12 @@ module.exports = async function handler(req, res) {
       res.status(upstream.status);
       const ct = upstream.headers.get("content-type");
       const cd = upstream.headers.get("content-disposition");
+      const cl = upstream.headers.get("content-length");
       if (ct) res.setHeader("Content-Type", ct);
       if (cd) res.setHeader("Content-Disposition", cd);
+      if (cl) res.setHeader("Content-Length", cl);
 
-      const arrayBuf = await upstream.arrayBuffer();
-      return res.send(Buffer.from(arrayBuf));
+      return Readable.fromWeb(upstream.body).pipe(res);
     } catch (err) {
       return res.status(500).json({ error: err.message });
     }
@@ -540,7 +544,7 @@ module.exports = async function handler(req, res) {
   const errors = [];
   const ytId = extractVideoId(targetUrl);
 
-  // 1. Try OmDown first (with deployment ID header)
+  // 1. Try OmDown first
   try {
     const omData = await resolveOmdown(targetUrl, baseApiUrl);
     if (omData.medias && omData.medias.length > 0) {
