@@ -1,6 +1,8 @@
 const https = require("https");
 const dns = require("dns");
 const querystring = require("querystring");
+const crypto = require("crypto");
+const vm = require("vm");
 
 dns.setServers(["8.8.8.8", "1.1.1.1"]);
 
@@ -56,119 +58,7 @@ function extractVideoId(url) {
 }
 
 // ==========================================
-// 1. Y2MATE RESOLVER (YouTube)
-// ==========================================
-function makeHttpsRequest(urlStr, method, headers = {}, body = null) {
-  return new Promise((resolve, reject) => {
-    const url = new URL(urlStr);
-    const options = {
-      hostname: url.hostname,
-      port: 443,
-      path: url.pathname + url.search,
-      method,
-      headers: { "User-Agent": DEFAULT_UA, ...headers },
-    };
-
-    const req = https.request(options, (res) => {
-      let data = "";
-      res.on("data", (chunk) => (data += chunk));
-      res.on("end", () => resolve({ statusCode: res.statusCode, body: data }));
-    });
-    req.on("error", reject);
-    if (body) req.write(body);
-    req.end();
-  });
-}
-
-async function resolveY2mate(videoId) {
-  let title = "YouTube Video";
-  try {
-    const metaRes = await makeHttpsRequest(
-      `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`,
-      "GET"
-    );
-    if (metaRes.statusCode === 200) {
-      const meta = JSON.parse(metaRes.body);
-      if (meta.title) title = meta.title;
-    }
-  } catch {}
-
-  const keyHeaders = {
-    "Content-Type": "application/json",
-    Origin: "https://frame.y2meta-uk.com",
-    Referer: `https://frame.y2meta-uk.com/wwwindex.php?videoId=${videoId}`,
-  };
-  const keyRes = await makeHttpsRequest("https://cnv.cx/v2/sanity/key", "GET", keyHeaders);
-  if (keyRes.statusCode !== 200) {
-    throw new Error(`Y2mate key HTTP ${keyRes.statusCode}`);
-  }
-
-  const sanityKey = JSON.parse(keyRes.body).key;
-  if (!sanityKey) throw new Error("Y2mate sanity key missing");
-
-  const presets = [
-    { format: "mp4", videoQuality: "1080", audioBitrate: "128", label: "1080p Full HD" },
-    { format: "mp4", videoQuality: "720", audioBitrate: "128", label: "720p HD" },
-    { format: "mp4", videoQuality: "360", audioBitrate: "128", label: "360p SD" },
-    { format: "mp3", videoQuality: "720", audioBitrate: "320", label: "320kbps MP3" },
-  ];
-
-  const results = await Promise.allSettled(
-    presets.map(async (p) => {
-      const body = querystring.stringify({
-        link: `https://youtu.be/${videoId}`,
-        format: p.format,
-        audioBitrate: p.audioBitrate,
-        videoQuality: p.videoQuality,
-        filenameStyle: "pretty",
-        vCodec: "h264",
-      });
-
-      const res = await makeHttpsRequest(
-        "https://cnv.cx/v2/converter",
-        "POST",
-        {
-          "Content-Type": "application/x-www-form-urlencoded",
-          accept: "*/*",
-          key: sanityKey,
-          "Content-Length": Buffer.byteLength(body),
-          Origin: "https://frame.y2meta-uk.com",
-          Referer: `https://frame.y2meta-uk.com/wwwindex.php?videoId=${videoId}`,
-        },
-        body
-      );
-
-      if (res.statusCode !== 200) return null;
-      const data = JSON.parse(res.body);
-      if (!data || !data.url) return null;
-
-      return {
-        url: data.url,
-        quality: p.label,
-        extension: p.format,
-        type: p.format === "mp3" ? "audio" : "video",
-        label: `${p.label} (${p.format.toUpperCase()})`,
-      };
-    })
-  );
-
-  const medias = results
-    .filter((r) => r.status === "fulfilled" && r.value !== null)
-    .map((r) => r.value);
-
-  if (medias.length === 0) throw new Error("Y2mate returned no streams");
-
-  return {
-    source: "y2mate",
-    platform: "YouTube",
-    title,
-    thumbnail: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
-    medias,
-  };
-}
-
-// ==========================================
-// 2. OMDOWN RESOLVER (Multi-Platform)
+// 1. OMDOWN RESOLVER (with Deployment ID)
 // ==========================================
 function parseFlightStream(raw) {
   const chunks = new Map();
@@ -225,7 +115,8 @@ async function resolveOmdown(mediaUrl, baseApiUrl) {
   const initRes = await fetch(`${OMDOWN_BASE}/${locale}`, {
     headers: {
       "User-Agent": DEFAULT_UA,
-      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+      Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+      "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
     },
   });
 
@@ -251,7 +142,11 @@ async function resolveOmdown(mediaUrl, baseApiUrl) {
   const html = await initRes.text();
   let actionId = null;
 
-  const scriptMatches = [...html.matchAll(/src=["'](\/_next\/static\/chunks\/[^"']+\.js)["']/g)];
+  // Extract Vercel deployment ID if present in chunk URLs (?dpl=...)
+  const dplMatch = html.match(/[?&]dpl=(dpl_[a-zA-Z0-9]+)/);
+  const deploymentId = dplMatch ? dplMatch[1] : null;
+
+  const scriptMatches = [...html.matchAll(/src=["'](\/_next\/static\/chunks\/[^"']+\.js[^"']*)["']/g)];
   for (const m of scriptMatches) {
     try {
       const sRes = await fetch(`${OMDOWN_BASE}${m[1]}`, { headers: { "User-Agent": DEFAULT_UA } });
@@ -272,18 +167,27 @@ async function resolveOmdown(mediaUrl, baseApiUrl) {
 
   actionId = actionId || FALLBACK_ACTION_ID;
 
+  const actionHeaders = {
+    "User-Agent": DEFAULT_UA,
+    Accept: "text/x-component",
+    "Accept-Language": "id-ID,id;q=0.9,en-US;q=0.8,en;q=0.7",
+    "Content-Type": "text/plain;charset=UTF-8",
+    "Next-Action": actionId,
+    "Next-Router-State-Tree": NEXT_ROUTER_STATE_TREE,
+    Origin: OMDOWN_BASE,
+    Referer: `${OMDOWN_BASE}/${locale}`,
+    Cookie: cookies,
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-origin",
+  };
+  if (deploymentId) {
+    actionHeaders["x-deployment-id"] = deploymentId;
+  }
+
   const actionRes = await fetch(`${OMDOWN_BASE}/${locale}`, {
     method: "POST",
-    headers: {
-      "User-Agent": DEFAULT_UA,
-      Accept: "text/x-component",
-      "Content-Type": "text/plain;charset=UTF-8",
-      "Next-Action": actionId,
-      "Next-Router-State-Tree": NEXT_ROUTER_STATE_TREE,
-      Origin: OMDOWN_BASE,
-      Referer: `${OMDOWN_BASE}/${locale}`,
-      Cookie: cookies,
-    },
+    headers: actionHeaders,
     body: JSON.stringify([mediaUrl.trim(), platform, locale]),
   });
 
@@ -349,7 +253,243 @@ async function resolveOmdown(mediaUrl, baseApiUrl) {
 }
 
 // ==========================================
-// 3. VERCEL SERVERLESS HANDLER
+// 2. SAVEFROM RESOLVER (from savefrom.js)
+// ==========================================
+async function resolveSaveFrom(targetUrl) {
+  const SALT = "b7944d7a59c9cb654228624880e7de59a53842c2d912b449fdf11febcf81cb21";
+  const ts = Date.now();
+  const hash = crypto
+    .createHash("sha256")
+    .update(targetUrl + ts + SALT)
+    .digest("hex");
+
+  const form = new URLSearchParams({
+    sf_url: targetUrl,
+    sf_submit: "",
+    new: "2",
+    lang: "en",
+    app: "",
+    country: "en",
+    os: "Windows",
+    browser: "Chrome",
+    channel: "main",
+    "sf-nomad": "1",
+    url: targetUrl,
+    ts: String(ts),
+    _ts: "1720433117117",
+    _tsc: "0",
+    _s: hash,
+    _x: "1",
+  });
+
+  const response = await fetch("https://worker.savefrom.net/savefrom.php", {
+    method: "POST",
+    headers: {
+      accept: "*/*",
+      "accept-language": "en-US,en;q=0.9",
+      "content-type": "application/x-www-form-urlencoded",
+      origin: "https://en.savefrom.net",
+      referer: "https://en.savefrom.net/",
+      "user-agent": DEFAULT_UA,
+    },
+    body: form.toString(),
+  });
+
+  if (!response.ok) throw new Error(`SaveFrom HTTP ${response.status}`);
+  const jsResponse = await response.text();
+
+  let resultData = null;
+  let errorMessage = null;
+
+  const sfMock = {
+    videoResult: {
+      show: (res) => { resultData = res; },
+      showRows: (res) => { resultData = res; },
+    },
+    finishRequest: () => {},
+    enableElement: () => {},
+    result: {
+      show: (res) => {
+        if (res && res.success === false) errorMessage = res.html || "No links";
+        else resultData = res;
+      },
+      showEmptyResult: (res) => {
+        errorMessage = (res && res.html) || "Empty result";
+      },
+    },
+  };
+
+  const context = {
+    window: null,
+    location: { hostname: "en.savefrom.net" },
+    frameElement: {},
+    atob: (b64) => Buffer.from(b64, "base64").toString(),
+    _decodeURIComponent: (uri) => decodeURIComponent(uri),
+  };
+  context.window = context;
+  context.parent = {
+    sf: sfMock,
+    document: {
+      location: { hostname: "en.savefrom.net" },
+      getElementById: () => ({ innerHTML: "mock" }),
+      body: { firstChild: null, removeChild: () => {} },
+    },
+  };
+  context.document = context.parent.document;
+
+  vm.createContext(context);
+  new vm.Script(`decodeURIComponent=_decodeURIComponent;${jsResponse}`).runInContext(context);
+
+  if (errorMessage) throw new Error(errorMessage.replace(/<[^>]*>/g, ""));
+  if (!resultData) throw new Error("SaveFrom parse failed");
+
+  const medias = [];
+  if (Array.isArray(resultData.url)) {
+    resultData.url.forEach((item) => {
+      if (item.url) {
+        const q = item.quality ? `${item.quality}p` : item.subname || "SD";
+        const ext = item.ext || item.type || "mp4";
+        medias.push({
+          url: item.url,
+          quality: q,
+          extension: ext,
+          type: ext === "mp3" || ext === "m4a" ? "audio" : "video",
+          label: `${q} (${ext.toUpperCase()})`,
+        });
+      }
+    });
+  }
+
+  if (medias.length === 0) throw new Error("SaveFrom returned 0 links");
+
+  return {
+    source: "savefrom",
+    platform: resultData.hosting || "Media",
+    title: resultData.meta?.title || "Media Download",
+    thumbnail: resultData.thumb || "",
+    medias,
+  };
+}
+
+// ==========================================
+// 3. Y2MATE RESOLVER (from y2mate.js)
+// ==========================================
+function makeHttpsRequest(urlStr, method, headers = {}, body = null) {
+  return new Promise((resolve, reject) => {
+    const url = new URL(urlStr);
+    const options = {
+      hostname: url.hostname,
+      port: 443,
+      path: url.pathname + url.search,
+      method,
+      headers: {
+        "User-Agent": DEFAULT_UA,
+        Accept: "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
+        ...headers,
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => (data += chunk));
+      res.on("end", () => resolve({ statusCode: res.statusCode, body: data }));
+    });
+    req.on("error", reject);
+    if (body) req.write(body);
+    req.end();
+  });
+}
+
+async function resolveY2mate(videoId) {
+  let title = "YouTube Video";
+  try {
+    const metaRes = await makeHttpsRequest(
+      `https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=${videoId}&format=json`,
+      "GET"
+    );
+    if (metaRes.statusCode === 200) {
+      const meta = JSON.parse(metaRes.body);
+      if (meta.title) title = meta.title;
+    }
+  } catch {}
+
+  const keyRes = await makeHttpsRequest("https://cnv.cx/v2/sanity/key", "GET", {
+    "Content-Type": "application/json",
+    Origin: "https://frame.y2meta-uk.com",
+    Referer: `https://frame.y2meta-uk.com/wwwindex.php?videoId=${videoId}`,
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "cross-site",
+  });
+  if (keyRes.statusCode !== 200) {
+    throw new Error(`Y2mate key HTTP ${keyRes.statusCode}`);
+  }
+
+  const sanityKey = JSON.parse(keyRes.body).key;
+  if (!sanityKey) throw new Error("Y2mate sanity key missing");
+
+  const presets = [
+    { format: "mp4", videoQuality: "720", audioBitrate: "128", label: "720p HD" },
+    { format: "mp4", videoQuality: "360", audioBitrate: "128", label: "360p SD" },
+    { format: "mp3", videoQuality: "720", audioBitrate: "320", label: "320kbps MP3" },
+  ];
+
+  const results = await Promise.allSettled(
+    presets.map(async (p) => {
+      const body = querystring.stringify({
+        link: `https://youtu.be/${videoId}`,
+        format: p.format,
+        audioBitrate: p.audioBitrate,
+        videoQuality: p.videoQuality,
+        filenameStyle: "pretty",
+        vCodec: "h264",
+      });
+
+      const res = await makeHttpsRequest(
+        "https://cnv.cx/v2/converter",
+        "POST",
+        {
+          "Content-Type": "application/x-www-form-urlencoded",
+          key: sanityKey,
+          "Content-Length": Buffer.byteLength(body),
+          Origin: "https://frame.y2meta-uk.com",
+          Referer: `https://frame.y2meta-uk.com/wwwindex.php?videoId=${videoId}`,
+        },
+        body
+      );
+
+      if (res.statusCode !== 200) return null;
+      const data = JSON.parse(res.body);
+      if (!data || !data.url) return null;
+
+      return {
+        url: data.url,
+        quality: p.label,
+        extension: p.format,
+        type: p.format === "mp3" ? "audio" : "video",
+        label: `${p.label} (${p.format.toUpperCase()})`,
+      };
+    })
+  );
+
+  const medias = results
+    .filter((r) => r.status === "fulfilled" && r.value !== null)
+    .map((r) => r.value);
+
+  if (medias.length === 0) throw new Error("Y2mate returned no streams");
+
+  return {
+    source: "y2mate",
+    platform: "YouTube",
+    title,
+    thumbnail: `https://i.ytimg.com/vi/${videoId}/hqdefault.jpg`,
+    medias,
+  };
+}
+
+// ==========================================
+// 4. VERCEL SERVERLESS HANDLER
 // ==========================================
 module.exports = async function handler(req, res) {
   res.setHeader("Access-Control-Allow-Origin", "*");
@@ -362,7 +502,6 @@ module.exports = async function handler(req, res) {
   const host = req.headers.host;
   const baseApiUrl = `${proto}://${host}/api/download`;
 
-  // Proxy for session-locked OmDown streams
   if (req.query.proxy === "1") {
     const target = req.query.url;
     const ck = req.query.ck || "";
@@ -401,7 +540,18 @@ module.exports = async function handler(req, res) {
   const errors = [];
   const ytId = extractVideoId(targetUrl);
 
-  if (ytId && req.query.engine !== "omdown") {
+  // 1. Try OmDown first (with deployment ID header)
+  try {
+    const omData = await resolveOmdown(targetUrl, baseApiUrl);
+    if (omData.medias && omData.medias.length > 0) {
+      return res.status(200).json(omData);
+    }
+  } catch (err) {
+    errors.push(`OmDown: ${err.message}`);
+  }
+
+  // 2. Try Y2mate for YouTube
+  if (ytId) {
     try {
       const ytData = await resolveY2mate(ytId);
       return res.status(200).json(ytData);
@@ -410,11 +560,12 @@ module.exports = async function handler(req, res) {
     }
   }
 
+  // 3. Try SaveFrom fallback
   try {
-    const omData = await resolveOmdown(targetUrl, baseApiUrl);
-    return res.status(200).json(omData);
+    const sfData = await resolveSaveFrom(targetUrl);
+    return res.status(200).json(sfData);
   } catch (err) {
-    errors.push(`OmDown: ${err.message}`);
+    errors.push(`SaveFrom: ${err.message}`);
   }
 
   return res.status(500).json({ error: errors.join(" | ") });
